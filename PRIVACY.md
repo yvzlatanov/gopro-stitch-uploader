@@ -12,4 +12,4 @@ credentials stored locally on the developer's own machine.
 No data is shared with any third party. No analytics, tracking, or
 advertising is present in this tool.
 
-Contact: y.zlatanov@dveconstructions.com
+Contact: zlatanovionan@gmail.com
