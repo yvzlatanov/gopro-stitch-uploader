@@ -8,6 +8,10 @@ ffmpeg concatenates the chapters losslessly (`-c copy`, no re-encode) and pipes
 a fragmented MP4 into YouTube's resumable upload. The only thing that touches
 disk is a tiny text file listing the chapters. Your SD card is never modified.
 
+This is a personal, single-user, non-commercial tool. It uses **YouTube API
+Services** — see the [Privacy Policy](PRIVACY.md) and
+[Terms of Service](TERMS.md).
+
 ## Why "unlisted" needs a one-time audit
 
 YouTube locks videos uploaded through **unverified** API projects to *private*,
