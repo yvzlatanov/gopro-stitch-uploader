@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# Never commit OAuth credentials or tokens.
+client_secret*.json
+token.json
+*.env
