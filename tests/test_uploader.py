@@ -41,6 +41,57 @@ def test_parse_ack_end():
     assert uploader._parse_ack_end("garbage") == -1
 
 
+# ---------- read-ahead ----------
+
+def drain(reader):
+    chunks = []
+    with reader as source:
+        while True:
+            chunk = source.read()
+            if chunk is None:
+                break
+            chunks.append(chunk)
+    return chunks
+
+
+def test_prefetcher_yields_same_chunks_as_inline_reader():
+    data = b"a" * 700
+    prefetched = drain(uploader.ChunkPrefetcher(io.BytesIO(data), 256, depth=2))
+    inline = drain(uploader.InlineChunkReader(io.BytesIO(data), 256))
+    assert prefetched == inline
+    assert [len(c) for c in prefetched] == [256, 256, 188]
+
+
+def test_prefetcher_emits_empty_chunk_on_exact_boundary():
+    # The uploader relies on a trailing zero-length read to finalize.
+    chunks = drain(uploader.ChunkPrefetcher(io.BytesIO(b"b" * 512), 256))
+    assert [len(c) for c in chunks] == [256, 256, 0]
+
+
+def test_prefetcher_surfaces_reader_errors():
+    class Exploding(io.RawIOBase):
+        def readable(self):
+            return True
+
+        def read(self, size=-1):
+            raise OSError("pipe died")
+
+    with pytest.raises(OSError, match="pipe died"):
+        drain(uploader.ChunkPrefetcher(Exploding(), 256))
+
+
+def test_prefetcher_close_stops_reader_thread():
+    reader = uploader.ChunkPrefetcher(io.BytesIO(b"c" * 10_000), 256, depth=1)
+    with reader:
+        assert reader.read() is not None
+    assert not reader._thread.is_alive()
+
+
+def test_prefetcher_rejects_zero_chunk_size():
+    with pytest.raises(ValueError):
+        uploader.ChunkPrefetcher(io.BytesIO(b""), 0)
+
+
 # ---------- fake resumable server ----------
 
 class FakeResponse:
@@ -166,6 +217,30 @@ def test_progress_callback_reports_cumulative_bytes(small_chunks):
     )
     assert seen == sorted(seen)  # monotonic
     assert seen[-1] == 700
+
+
+@pytest.mark.parametrize("read_ahead", [0, 1, 3])
+def test_stream_upload_matches_across_read_ahead_depths(read_ahead):
+    server = FakeServer()
+    stream = io.BytesIO(b"y" * 700)
+    result = uploader.stream_upload(
+        server,
+        "https://upload/session/abc",
+        stream,
+        chunk_size=256,
+        read_ahead=read_ahead,
+    )
+    assert result == {"id": "vid123"}
+    assert server.received == 700
+    assert server.content_ranges[-1].endswith("/700")
+
+
+def test_stream_upload_honours_explicit_chunk_size():
+    server = FakeServer()
+    uploader.stream_upload(
+        server, "https://upload/session/abc", io.BytesIO(b"y" * 300), chunk_size=256
+    )
+    assert server.content_ranges[0] == "bytes 0-255/*"
 
 
 def test_metadata_body_shape():

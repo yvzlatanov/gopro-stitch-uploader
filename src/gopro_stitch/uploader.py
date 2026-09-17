@@ -10,10 +10,16 @@ speak the resumable protocol directly with ``requests``:
    ``bytes {start}-{end}/*`` and the final chunk carries the real total.
 3. Each chunk is buffered in RAM so it can be re-sent if the network drops or
    the server acknowledges only part of it (the pipe cannot seek backwards).
+
+A background thread reads the next chunk out of the pipe while the current one
+is being sent, so ffmpeg keeps working during the PUT instead of blocking on a
+full pipe for its entire duration.
 """
 
 from __future__ import annotations
 
+import queue
+import threading
 import time
 from dataclasses import dataclass
 from typing import BinaryIO, Callable, Protocol
@@ -101,6 +107,114 @@ def _read_chunk(stream: BinaryIO, size: int) -> bytes:
             break
         buf.extend(piece)
     return bytes(buf)
+
+
+class _StreamEnd:
+    """Sentinel queued once the source stream is exhausted."""
+
+
+_END = _StreamEnd()
+
+
+class InlineChunkReader:
+    """Read chunks on the calling thread — the no-read-ahead fallback."""
+
+    def __init__(self, stream: BinaryIO, chunk_size: int) -> None:
+        self._stream = stream
+        self._chunk_size = chunk_size
+        self._done = False
+
+    def __enter__(self) -> InlineChunkReader:
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        return False
+
+    def read(self) -> bytes | None:
+        if self._done:
+            return None
+        chunk = _read_chunk(self._stream, self._chunk_size)
+        if len(chunk) < self._chunk_size:
+            self._done = True
+        return chunk
+
+    def close(self) -> None:
+        self._done = True
+
+
+class ChunkPrefetcher:
+    """Read fixed-size chunks from a stream on a background thread.
+
+    Uploading is network-bound, so without read-ahead the ffmpeg pipe stays
+    blocked for the whole duration of every PUT and the concat only makes
+    progress between requests. This overlaps the two: ``depth`` chunks may sit
+    in the queue while another is being sent, for a peak of ``depth + 1``
+    chunks resident in memory.
+
+    Chunk boundaries are identical to reading inline, so the upload protocol is
+    unchanged: every chunk is a full ``chunk_size`` except the last.
+    """
+
+    def __init__(self, stream: BinaryIO, chunk_size: int, depth: int = 1) -> None:
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        self._stream = stream
+        self._chunk_size = chunk_size
+        self._queue: queue.Queue = queue.Queue(maxsize=max(1, depth))
+        self._error: BaseException | None = None
+        self._closing = threading.Event()
+        self._thread = threading.Thread(
+            target=self._fill, name="gopro-stitch-prefetch", daemon=True
+        )
+
+    def __enter__(self) -> ChunkPrefetcher:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        self.close()
+        return False
+
+    def _fill(self) -> None:
+        try:
+            while not self._closing.is_set():
+                chunk = _read_chunk(self._stream, self._chunk_size)
+                self._put(chunk)
+                if len(chunk) < self._chunk_size:
+                    break  # Short read means the stream ended.
+        except BaseException as exc:  # Re-raised in the consumer via read().
+            self._error = exc
+        finally:
+            self._put(_END)
+
+    def _put(self, item) -> None:
+        """Queue an item, giving up if the consumer has stopped draining."""
+        while not self._closing.is_set():
+            try:
+                self._queue.put(item, timeout=0.1)
+                return
+            except queue.Full:
+                continue
+
+    def read(self) -> bytes | None:
+        """Return the next chunk, or None once the stream is exhausted."""
+        item = self._queue.get()
+        if isinstance(item, _StreamEnd):
+            if self._error is not None:
+                raise self._error
+            return None
+        return item
+
+    def close(self) -> None:
+        """Stop the reader thread and release any chunks still queued."""
+        self._closing.set()
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+        if self._thread.is_alive():
+            self._thread.join(timeout=5)
 
 
 def _parse_ack_end(range_header: str | None) -> int:
@@ -215,33 +329,47 @@ def stream_upload(
     upload_url: str,
     stream: BinaryIO,
     on_progress: ProgressCallback | None = None,
+    chunk_size: int | None = None,
+    read_ahead: int | None = None,
 ) -> dict:
     """Read ``stream`` to EOF, uploading it in chunks. Returns the video JSON.
 
     ``on_progress`` receives the cumulative number of bytes uploaded so far.
+    ``read_ahead`` is how many chunks the reader thread may buffer ahead of the
+    upload; 0 disables read-ahead and reads inline.
     """
+    size = config.CHUNK_SIZE if chunk_size is None else chunk_size
+    depth = config.READ_AHEAD_CHUNKS if read_ahead is None else read_ahead
+    reader = (
+        ChunkPrefetcher(stream, size, depth)
+        if depth > 0
+        else InlineChunkReader(stream, size)
+    )
     offset = 0
     final_response: requests.Response | None = None
 
-    while True:
-        chunk = _read_chunk(stream, config.CHUNK_SIZE)
-        is_last = len(chunk) < config.CHUNK_SIZE  # short read => end of stream
-        total = offset + len(chunk) if is_last else None
+    with reader as chunks:
+        while True:
+            chunk = chunks.read()
+            if chunk is None:
+                break
+            is_last = len(chunk) < size  # short read => end of stream
+            total = offset + len(chunk) if is_last else None
 
-        if len(chunk) == 0 and offset > 0:
-            # Stream ended exactly on a chunk boundary: finalize with total known.
-            final_response = _finalize_boundary(session, upload_url, offset)
-            break
+            if len(chunk) == 0 and offset > 0:
+                # Stream ended exactly on a chunk boundary: finalize with total known.
+                final_response = _finalize_boundary(session, upload_url, offset)
+                break
 
-        final_response, acked = _send_with_resume(
-            session, upload_url, chunk, offset, total
-        )
-        offset = acked
-        if on_progress is not None:
-            on_progress(offset)
+            final_response, acked = _send_with_resume(
+                session, upload_url, chunk, offset, total
+            )
+            offset = acked
+            if on_progress is not None:
+                on_progress(offset)
 
-        if is_last:
-            break
+            if is_last:
+                break
 
     if final_response is None or final_response.status_code not in (200, 201):
         code = final_response.status_code if final_response is not None else "none"
