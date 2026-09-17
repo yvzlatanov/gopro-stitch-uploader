@@ -209,11 +209,36 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip ffprobe duration lookup (faster listing).",
     )
+    parser.add_argument(
+        "--test-auth",
+        action="store_true",
+        help=(
+            "Run only the Google OAuth consent flow, then exit. "
+            "No SD card scan, no stitching, no upload — useful for confirming "
+            "credentials work or for capturing a consent-screen screenshot."
+        ),
+    )
     return parser
+
+
+def run_test_auth() -> int:
+    print("Requesting OAuth credentials — a browser window will open for consent…")
+    try:
+        creds = auth.get_credentials()
+    except auth.AuthError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(f"✓ Authenticated. Token cached at {config.TOKEN_PATH}")
+    print(f"  Scope: {config.YOUTUBE_UPLOAD_SCOPE}")
+    print(f"  Token valid: {creds.valid}")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    if args.test_auth:
+        return run_test_auth()
 
     try:
         stitcher.check_ffmpeg_available()
