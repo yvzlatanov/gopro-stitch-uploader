@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import threading
+
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
 from . import config
+
+# Parallel uploads share one Credentials object. Serialize refresh and token
+# reads so two workers can't race a refresh and write token.json at once.
+_CREDENTIAL_LOCK = threading.RLock()
 
 
 class AuthError(RuntimeError):
@@ -39,35 +45,37 @@ def get_credentials() -> Credentials:
     First run opens a browser for one-time consent and caches the refresh token.
     Subsequent runs load and silently refresh it.
     """
-    creds = _load_cached()
+    with _CREDENTIAL_LOCK:
+        creds = _load_cached()
 
-    if creds and creds.valid:
-        return creds
+        if creds and creds.valid:
+            return creds
 
-    if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            _save(creds)
+            return creds
+
+        if not config.CLIENT_SECRET_PATH.exists():
+            raise AuthError(
+                "OAuth client secret not found at "
+                f"{config.CLIENT_SECRET_PATH}.\n"
+                "Create an OAuth Desktop client in Google Cloud, download it, and "
+                "save it there (or set GOPRO_STITCH_CLIENT_SECRET). See README."
+            )
+
+        flow = InstalledAppFlow.from_client_secrets_file(
+            str(config.CLIENT_SECRET_PATH), [config.YOUTUBE_UPLOAD_SCOPE]
+        )
+        creds = flow.run_local_server(port=0)
         _save(creds)
         return creds
-
-    if not config.CLIENT_SECRET_PATH.exists():
-        raise AuthError(
-            "OAuth client secret not found at "
-            f"{config.CLIENT_SECRET_PATH}.\n"
-            "Create an OAuth Desktop client in Google Cloud, download it, and "
-            "save it there (or set GOPRO_STITCH_CLIENT_SECRET). See README."
-        )
-
-    flow = InstalledAppFlow.from_client_secrets_file(
-        str(config.CLIENT_SECRET_PATH), [config.YOUTUBE_UPLOAD_SCOPE]
-    )
-    creds = flow.run_local_server(port=0)
-    _save(creds)
-    return creds
 
 
 def bearer_header(creds: Credentials) -> dict[str, str]:
     """Return an Authorization header, refreshing the token if it has expired."""
-    if not creds.valid and creds.refresh_token:
-        creds.refresh(Request())
-        _save(creds)
-    return {"Authorization": f"Bearer {creds.token}"}
+    with _CREDENTIAL_LOCK:
+        if not creds.valid and creds.refresh_token:
+            creds.refresh(Request())
+            _save(creds)
+        return {"Authorization": f"Bearer {creds.token}"}
