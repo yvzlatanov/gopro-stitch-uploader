@@ -82,6 +82,7 @@ def start_session(
         params=params,
         headers=headers,
         json=metadata.to_body(),
+        timeout=config.REQUEST_TIMEOUT,
     )
     if response.status_code not in (200, 201):
         raise UploadError(
@@ -247,7 +248,9 @@ def _put_chunk(
     else:
         content_range = f"bytes {offset}-{end}/{total_str}"
     headers = {"Content-Range": content_range}
-    return session.put(upload_url, headers=headers, data=chunk)
+    return session.put(
+        upload_url, headers=headers, data=chunk, timeout=config.REQUEST_TIMEOUT
+    )
 
 
 def _query_offset(
@@ -256,7 +259,9 @@ def _query_offset(
     """Ask the server how many bytes it already has. Returns next byte to send."""
     total_str = str(total) if total is not None else "*"
     headers = {"Content-Range": f"bytes */{total_str}"}
-    response = session.put(upload_url, headers=headers, data=b"")
+    response = session.put(
+        upload_url, headers=headers, data=b"", timeout=config.REQUEST_TIMEOUT
+    )
     if response.status_code in (200, 201):
         return -2  # Sentinel: server considers the upload already complete.
     return _parse_ack_end(response.headers.get("Range")) + 1
@@ -277,8 +282,11 @@ def _send_with_resume(
     backoff = config.INITIAL_BACKOFF_SECONDS
     chunk_end_exclusive = offset + len(chunk)
     send_from = offset
+    deadline = time.monotonic() + config.RETRY_WINDOW_SECONDS
 
     for attempt in range(config.MAX_RETRIES):
+        if attempt and time.monotonic() > deadline:
+            break
         try:
             sub = chunk[send_from - offset :]
             response = _put_chunk(session, upload_url, sub, send_from, total)
@@ -320,7 +328,8 @@ def _send_with_resume(
             pass
 
     raise UploadError(
-        f"Gave up on chunk at offset {offset} after {config.MAX_RETRIES} retries."
+        f"Gave up on chunk at offset {offset} after {config.MAX_RETRIES} attempts "
+        f"over {config.RETRY_WINDOW_SECONDS:.0f}s."
     )
 
 

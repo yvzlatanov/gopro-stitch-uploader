@@ -1,8 +1,10 @@
 """Unit tests for the resumable streaming upload logic (mocked HTTP)."""
 
 import io
+import time
 
 import pytest
+import requests
 
 from gopro_stitch import config, uploader
 
@@ -118,6 +120,12 @@ class FakeServer:
         self.put_count = 0
         self.content_ranges = []
 
+    def _incomplete(self):
+        # Google omits Range entirely until it has actually stored something.
+        if self.received == 0:
+            return FakeResponse(308)
+        return FakeResponse(308, headers={"Range": f"bytes=0-{self.received - 1}"})
+
     def post(self, url, **kwargs):
         return FakeResponse(200, headers={"Location": "https://upload/session/abc"})
 
@@ -134,9 +142,7 @@ class FakeServer:
         if spec == "*":
             if total_str != "*" and self.received >= int(total_str):
                 return FakeResponse(200, json_body={"id": "vid123"})
-            return FakeResponse(
-                308, headers={"Range": f"bytes=0-{self.received - 1}"}
-            )
+            return self._incomplete()
 
         start = int(spec.split("-")[0])
         length = len(data)
@@ -150,7 +156,7 @@ class FakeServer:
 
         if total_str != "*" and self.received >= int(total_str):
             return FakeResponse(200, json_body={"id": "vid123"})
-        return FakeResponse(308, headers={"Range": f"bytes=0-{self.received - 1}"})
+        return self._incomplete()
 
 
 @pytest.fixture
@@ -241,6 +247,62 @@ def test_stream_upload_honours_explicit_chunk_size():
         server, "https://upload/session/abc", io.BytesIO(b"y" * 300), chunk_size=256
     )
     assert server.content_ranges[0] == "bytes 0-255/*"
+
+
+# ---------- resilience ----------
+
+def test_every_request_sets_a_timeout():
+    """A missing timeout lets a half-open connection stall the upload forever."""
+    server = FakeServer()
+    seen = []
+
+    class Recording:
+        def post(self, url, **kwargs):
+            seen.append(kwargs.get("timeout"))
+            return server.post(url, **kwargs)
+
+        def put(self, url, **kwargs):
+            seen.append(kwargs.get("timeout"))
+            return server.put(url, **kwargs)
+
+    recorder = Recording()
+    uploader.start_session(recorder, {}, uploader.VideoMetadata(title="x"))
+    uploader.stream_upload(
+        recorder, "https://upload/session/abc", io.BytesIO(b"q" * 512), chunk_size=256
+    )
+    assert seen and all(t == config.REQUEST_TIMEOUT for t in seen)
+
+
+def test_retries_survive_a_transient_outage(monkeypatch):
+    """Six attempts ran out in about a minute; an outage must not lose the chunk."""
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    server = FakeServer()
+    outage = {"remaining": 5}
+
+    class Flaky:
+        def put(self, url, **kwargs):
+            if outage["remaining"] > 0:
+                outage["remaining"] -= 1
+                raise requests.RequestException("connection reset")
+            return server.put(url, **kwargs)
+
+    response, acked = uploader._send_with_resume(
+        Flaky(), "https://upload/session/abc", b"p" * 256, 0, 256
+    )
+    assert acked == 256
+    assert response.status_code == 200
+
+
+def test_retries_stop_once_the_window_closes(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    monkeypatch.setattr(config, "RETRY_WINDOW_SECONDS", 0.0)
+
+    class Dead:
+        def put(self, url, **kwargs):
+            raise requests.RequestException("down")
+
+    with pytest.raises(uploader.UploadError, match="Gave up"):
+        uploader._send_with_resume(Dead(), "https://upload/session/abc", b"p", 0, 1)
 
 
 def test_metadata_body_shape():
