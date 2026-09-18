@@ -32,14 +32,47 @@ YOUTUBE_RESUMABLE_URL = "https://www.googleapis.com/upload/youtube/v3/videos"
 CHUNK_SIZE = 256 * 1024 * 1024  # must stay a multiple of 256 * 1024
 UPLOAD_GRANULARITY = 256 * 1024
 
+# Chunks the reader thread may run ahead of the uploader. Each queued chunk is
+# CHUNK_SIZE of RAM on top of the one currently being sent, so 1 means ffmpeg
+# fills the next chunk while the current one is in flight at a peak of two.
+READ_AHEAD_CHUNKS = 1
+
+# Stints uploaded at the same time. One is the safe default: concurrent uploads
+# share the same uplink, so this only helps when a single stream cannot
+# saturate it. Peak memory is roughly parallel * (READ_AHEAD_CHUNKS + 1) chunks.
+DEFAULT_PARALLEL_UPLOADS = 1
+
+
+def normalize_chunk_size(megabytes: int) -> int:
+    """Convert a chunk size in MB to bytes, enforcing the 256 KB granularity."""
+    if megabytes < 1:
+        raise ValueError("chunk size must be at least 1 MB")
+    size = megabytes * 1024 * 1024
+    if size % UPLOAD_GRANULARITY:
+        raise ValueError(
+            f"chunk size must be a multiple of {UPLOAD_GRANULARITY // 1024} KB"
+        )
+    return size
+
 # GoPro chapter file prefixes: GX = HERO6+ (HEVC), GH = older HERO models.
 CHAPTER_PREFIXES = ("GX", "GH")
 VIDEO_EXTENSION = ".MP4"
 
-# Networking retry policy for transient upload failures.
-MAX_RETRIES = 6
+# Networking retry policy for transient upload failures. A multi-hour upload
+# has to survive more than a momentary blip: at six attempts the backoff runs
+# out after about a minute, which is long enough to lose hours of work to a
+# brief outage. The window bounds how long a single chunk may keep retrying.
+MAX_RETRIES = 10
 INITIAL_BACKOFF_SECONDS = 1.0
 MAX_BACKOFF_SECONDS = 60.0
+RETRY_WINDOW_SECONDS = 900.0
+
+# Without a timeout a half-open connection blocks the upload forever: the
+# socket never errors, so no retry is triggered and the transfer simply stops.
+# requests applies this to the underlying socket, so it bounds sends too.
+CONNECT_TIMEOUT_SECONDS = 15.0
+SOCKET_TIMEOUT_SECONDS = 120.0
+REQUEST_TIMEOUT = (CONNECT_TIMEOUT_SECONDS, SOCKET_TIMEOUT_SECONDS)
 
 
 def ensure_config_dir() -> None:

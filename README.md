@@ -60,6 +60,9 @@ gopro-stitch
 
 # Point at a different card/folder:
 gopro-stitch --dcim "/Volumes/GoPro SD/DCIM/100GOPRO"
+
+# Upload three recordings at once, with a smaller chunk to keep memory down:
+gopro-stitch --parallel 3 --chunk-mb 64
 ```
 
 Example session:
@@ -81,6 +84,25 @@ Which to upload? [all / e.g. 1,3 / skip]: 2
     ✓ https://youtu.be/xxxxxxxxxxx
 ```
 
+## Throughput
+
+The join itself is already free — `-c copy` is a stream copy, so stitching runs
+at disk-read speed. Wall-clock time is essentially all upload, and two knobs
+address that:
+
+- **Read-ahead** (`--read-ahead`, default 1): a background thread fills the next
+  chunk while the current one is in flight, so ffmpeg keeps reading during a
+  request instead of blocking on a full pipe for its whole duration. Pass `0`
+  to read inline.
+- **Parallel uploads** (`--parallel`, default 1): upload several recordings at
+  the same time. This only helps if a single stream can't saturate your uplink
+  — concurrent uploads share the same bandwidth. Titles for every recording are
+  collected up front, so nothing stops to ask for input mid-run.
+
+Peak memory is roughly `parallel × (read-ahead + 1) × chunk size`, so lower
+`--chunk-mb` when raising `--parallel`: `--parallel 3 --chunk-mb 64` holds about
+384 MB, against 1.5 GB at the default 256 MB chunk.
+
 ## Notes & limits
 
 - **Quota**: `videos.insert` costs 1600 of the default 10,000 units/day → about
@@ -98,4 +120,7 @@ pytest
 
 Covers chapter parsing/grouping (including orphaned sidecars and missing
 chapters) and the resumable upload chunking, `Content-Range`, exact-boundary,
-and partial-ack resume paths against a simulated server.
+and partial-ack resume paths against a simulated server. Also covers the
+read-ahead reader (identical chunk boundaries to reading inline, error
+propagation) and parallel scheduling, including that concurrent uploads really
+do overlap and that one failure doesn't take down the rest of the batch.
