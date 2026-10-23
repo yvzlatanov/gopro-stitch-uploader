@@ -69,7 +69,10 @@ RETRY_WINDOW_SECONDS = 900.0
 
 # Without a timeout a half-open connection blocks the upload forever: the
 # socket never errors, so no retry is triggered and the transfer simply stops.
-# requests applies this to the underlying socket, so it bounds sends too.
+# While a chunk is being sent the *connect* timeout is the one in force, applied
+# per block written (see uploader._put_chunk), so it bounds a stalled send
+# rather than the time a whole chunk takes; the socket timeout then bounds the
+# wait for the server's reply.
 CONNECT_TIMEOUT_SECONDS = 15.0
 SOCKET_TIMEOUT_SECONDS = 120.0
 REQUEST_TIMEOUT = (CONNECT_TIMEOUT_SECONDS, SOCKET_TIMEOUT_SECONDS)
