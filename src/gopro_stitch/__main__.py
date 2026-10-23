@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures as futures
 import datetime as dt
+import logging
 import sys
 import threading
 import time
@@ -208,6 +209,32 @@ class ProgressReporter:
         self._last_logged[slot] = percent
         self._stream.write(f"    {self._row(slot)}\n")
         self._stream.flush()
+
+    def message(self, text: str) -> None:
+        """Print a one-off note without corrupting the rows painted in place."""
+        with self._lock:
+            if not (self._tty and self._rows_painted):
+                self._stream.write(f"  {text}\n")
+                self._stream.flush()
+                return
+            # Write the note over the top row, then draw the rows again below it.
+            self._stream.write(f"\033[{self._rows_painted}A\r\033[K  {text}\n")
+            self._rows_painted = 0
+            self._repaint(force=True)
+
+
+class ProgressLogHandler(logging.Handler):
+    """Route log records (e.g. upload retries) through the progress display."""
+
+    def __init__(self, reporter: ProgressReporter) -> None:
+        super().__init__(level=logging.WARNING)
+        self._reporter = reporter
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self._reporter.message(f"⚠ {self.format(record)}")
+        except Exception:
+            self.handleError(record)
 
 
 # ---------- upload one group ----------
@@ -466,7 +493,14 @@ def main(argv: list[str] | None = None) -> int:
         labels=[f"{job.group.prefix}{job.group.video_id}" for job in jobs],
         totals=[job.group.total_bytes for job in jobs],
     )
-    results = run_jobs(jobs, creds, progress, parallel, chunk_size, read_ahead)
+    # Retries are otherwise silent: a stuck upload would look frozen in the log.
+    package_log = logging.getLogger("gopro_stitch")
+    log_handler = ProgressLogHandler(progress)
+    package_log.addHandler(log_handler)
+    try:
+        results = run_jobs(jobs, creds, progress, parallel, chunk_size, read_ahead)
+    finally:
+        package_log.removeHandler(log_handler)
 
     uploaded_bytes = sum(
         job.group.total_bytes for job, url in zip(jobs, results) if url is not None

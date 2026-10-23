@@ -1,6 +1,7 @@
 """Unit tests for the CLI's scheduling and progress reporting."""
 
 import io
+import logging
 import threading
 from contextlib import contextmanager
 
@@ -172,3 +173,30 @@ def test_progress_repaints_in_place_on_a_tty():
     # Second paint must move the cursor back up over the first block.
     assert "\033[2A" in output
     assert "✓ one" in output and "✓ two" in output
+
+
+def test_progress_message_prints_above_the_rows_on_a_tty():
+    class Tty(io.StringIO):
+        def isatty(self):
+            return True
+
+    reporter = cli.ProgressReporter(["A"], [100], stream=Tty())
+    reporter.callback(0)(50)
+    reporter.message("retrying chunk")
+    output = reporter._stream.getvalue()
+    # The note replaces the old rows and the rows are drawn again beneath it.
+    note_at = output.index("retrying chunk")
+    assert "\033[1A" in output[:note_at]
+    assert "A  uploading" in output[note_at:]
+
+
+def test_upload_warnings_reach_the_progress_stream():
+    reporter = make_reporter(["GX0118"], [1000])
+    handler = cli.ProgressLogHandler(reporter)
+    log = logging.getLogger("gopro_stitch.uploader")
+    log.addHandler(handler)
+    try:
+        log.warning("chunk at offset %d failed", 0)
+    finally:
+        log.removeHandler(handler)
+    assert "chunk at offset 0 failed" in reporter._stream.getvalue()

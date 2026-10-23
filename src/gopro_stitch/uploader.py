@@ -18,6 +18,8 @@ full pipe for its entire duration.
 
 from __future__ import annotations
 
+import io
+import logging
 import queue
 import threading
 import time
@@ -28,6 +30,7 @@ import requests
 
 from . import config
 
+log = logging.getLogger(__name__)
 
 class SessionLike(Protocol):
     """Minimal interface we need from requests.Session (eases testing)."""
@@ -248,8 +251,15 @@ def _put_chunk(
     else:
         content_range = f"bytes {offset}-{end}/{total_str}"
     headers = {"Content-Range": content_range}
+    # urllib3 writes the body while the *connect* timeout is in force, and
+    # sendall() treats a timeout as a deadline for the whole call — so a bytes
+    # body had CONNECT_TIMEOUT_SECONDS to transfer the entire chunk. From a file
+    # object it goes out in small blocks with the timeout applied to each, which
+    # catches a stalled connection without capping a slow but steady one. An
+    # empty body stays bytes: requests would send an empty stream chunked.
+    body = io.BytesIO(chunk) if chunk else b""
     return session.put(
-        upload_url, headers=headers, data=chunk, timeout=config.REQUEST_TIMEOUT
+        upload_url, headers=headers, data=body, timeout=config.REQUEST_TIMEOUT
     )
 
 
@@ -290,8 +300,9 @@ def _send_with_resume(
         try:
             sub = chunk[send_from - offset :]
             response = _put_chunk(session, upload_url, sub, send_from, total)
-        except requests.RequestException:
+        except requests.RequestException as exc:
             response = None
+            failure = f"{type(exc).__name__}: {exc}"
 
         if response is not None:
             status = response.status_code
@@ -311,9 +322,16 @@ def _send_with_resume(
                 raise UploadError(
                     f"Upload chunk failed ({status}): {response.text[:500]}"
                 )
+            failure = f"HTTP {status}: {response.text[:200]}"
 
         # Transient failure (network error or 5xx): back off then re-sync offset.
-        time.sleep(min(backoff, config.MAX_BACKOFF_SECONDS))
+        delay = min(backoff, config.MAX_BACKOFF_SECONDS)
+        log.warning(
+            "Chunk at offset %d: attempt %d/%d failed (%s); retrying from byte %d "
+            "in %.0fs",
+            offset, attempt + 1, config.MAX_RETRIES, failure, send_from, delay,
+        )
+        time.sleep(delay)
         backoff *= 2
         try:
             resynced = _query_offset(session, upload_url, total)
@@ -324,8 +342,8 @@ def _send_with_resume(
                 ), chunk_end_exclusive
             if resynced >= 0:
                 send_from = max(send_from, resynced)
-        except requests.RequestException:
-            pass
+        except requests.RequestException as exc:
+            log.warning("Could not re-sync upload offset (%s)", exc)
 
     raise UploadError(
         f"Gave up on chunk at offset {offset} after {config.MAX_RETRIES} attempts "
@@ -398,10 +416,14 @@ def _finalize_boundary(
     for _ in range(config.MAX_RETRIES):
         try:
             response = _put_chunk(session, upload_url, b"", total, total)
-        except requests.RequestException:
+        except requests.RequestException as exc:
             response = None
-        if response is not None and response.status_code in (200, 201):
-            return response
+            failure = f"{type(exc).__name__}: {exc}"
+        else:
+            if response.status_code in (200, 201):
+                return response
+            failure = f"HTTP {response.status_code}"
+        log.warning("Finalizing the upload failed (%s); retrying", failure)
         time.sleep(min(backoff, config.MAX_BACKOFF_SECONDS))
         backoff *= 2
     raise UploadError("Failed to finalize upload after full chunks were sent.")

@@ -1,6 +1,9 @@
 """Unit tests for the resumable streaming upload logic (mocked HTTP)."""
 
 import io
+import logging
+import socket
+import threading
 import time
 
 import pytest
@@ -133,6 +136,8 @@ class FakeServer:
         self.put_count += 1
         headers = kwargs.get("headers", {})
         data = kwargs.get("data", b"") or b""
+        if hasattr(data, "read"):
+            data = data.read()
         content_range = headers["Content-Range"]
         self.content_ranges.append(content_range)
 
@@ -317,3 +322,138 @@ def test_metadata_body_shape():
 def test_video_url():
     assert uploader.video_url({"id": "abc"}) == "https://youtu.be/abc"
     assert "unknown" in uploader.video_url({})
+
+
+# ---------- send timeout ----------
+
+class SlowReceiver:
+    """A real local HTTP endpoint that drains request bodies at a throttled rate.
+
+    Fake sessions can't catch the send-timeout bug: it lives in how urllib3 and
+    the socket layer apply the timeout while a body is being written.
+    """
+
+    def __init__(self, piece=64 * 1024, pause=0.01):
+        self.piece = piece
+        self.pause = pause
+        self.received = 0
+        self.listener = socket.socket()
+        # A tiny receive window keeps the client's send blocked on our pace.
+        self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 * 1024)
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(1)
+        self.url = f"http://127.0.0.1:{self.listener.getsockname()[1]}/upload"
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    def _serve(self):
+        conn, _ = self.listener.accept()
+        with conn:
+            head = b""
+            while b"\r\n\r\n" not in head:
+                head += conn.recv(4096)
+            head, body = head.split(b"\r\n\r\n", 1)
+            length = int(
+                next(
+                    line.split(b":", 1)[1]
+                    for line in head.split(b"\r\n")
+                    if line.lower().startswith(b"content-length:")
+                )
+            )
+            self.received = len(body)
+            while self.received < length:
+                data = conn.recv(min(self.piece, length - self.received))
+                if not data:
+                    return
+                self.received += len(data)
+                time.sleep(self.pause)
+            conn.sendall(
+                b"HTTP/1.1 308 Resume Incomplete\r\n"
+                + f"Range: bytes=0-{self.received - 1}\r\n".encode()
+                + b"Content-Length: 0\r\n\r\n"
+            )
+
+    def close(self):
+        self.listener.close()
+
+
+def test_chunk_send_is_not_capped_by_the_connect_timeout(monkeypatch):
+    """A steady but slow upload must not time out just because it takes a while.
+
+    urllib3 writes the body under the *connect* timeout, and sendall() treats a
+    timeout as a deadline for the whole call. Passing the chunk as bytes gave
+    every chunk CONNECT_TIMEOUT_SECONDS to transfer in full: on a ~14 Mbps
+    uplink a 256 MB chunk was cut off after 15 s, every time.
+    """
+    monkeypatch.setattr(config, "REQUEST_TIMEOUT", (0.2, 5.0))
+    receiver = SlowReceiver()
+    chunk = b"c" * (8 * 1024 * 1024)  # ~1.3 s to drain at the throttled pace
+    try:
+        with requests.Session() as session:
+            response = uploader._put_chunk(session, receiver.url, chunk, 0, None)
+    finally:
+        receiver.close()
+    assert response.status_code == 308
+    assert receiver.received == len(chunk)
+
+
+# ---------- retry diagnostics ----------
+
+def test_retry_logs_why_a_chunk_attempt_failed(monkeypatch, caplog):
+    """Swallowed exceptions left a stuck upload with nothing in the log."""
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    server = FakeServer()
+    outage = {"remaining": 1}
+
+    class Flaky:
+        def put(self, url, **kwargs):
+            if outage["remaining"] > 0:
+                outage["remaining"] -= 1
+                raise requests.ConnectionError("The write operation timed out")
+            return server.put(url, **kwargs)
+
+    with caplog.at_level(logging.WARNING, logger="gopro_stitch.uploader"):
+        uploader._send_with_resume(
+            Flaky(), "https://upload/session/abc", b"p" * 256, 0, 256
+        )
+    assert "The write operation timed out" in caplog.text
+    assert "offset 0" in caplog.text
+
+
+def test_retry_logs_a_server_error_status(monkeypatch, caplog):
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    server = FakeServer()
+    calls = {"n": 0}
+
+    class Overloaded:
+        def put(self, url, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return FakeResponse(503, text="backend busy")
+            return server.put(url, **kwargs)
+
+    with caplog.at_level(logging.WARNING, logger="gopro_stitch.uploader"):
+        uploader._send_with_resume(
+            Overloaded(), "https://upload/session/abc", b"p" * 256, 0, 256
+        )
+    assert "503" in caplog.text
+
+
+def test_retry_logs_a_308_that_acknowledged_nothing_new(monkeypatch, caplog):
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    server = FakeServer()
+    calls = {"n": 0}
+
+    class Stingy:
+        def put(self, url, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return FakeResponse(308)  # nothing stored yet
+            return server.put(url, **kwargs)
+
+    with caplog.at_level(logging.WARNING, logger="gopro_stitch.uploader"):
+        _, acked = uploader._send_with_resume(
+            Stingy(), "https://upload/session/abc", b"p" * 256, 0, 256
+        )
+    assert acked == 256
+    assert "308" in caplog.text
